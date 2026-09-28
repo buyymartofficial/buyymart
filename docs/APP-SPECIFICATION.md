@@ -5,7 +5,7 @@
 **Market:** India (INR, GST invoices, pin-code delivery)  
 **Document purpose:** Define what BuyyMart is, which applications the ecosystem needs, the type of each application, and what each one must do.
 
-Company, tax, and policy paperwork lives in [STARTUP-DOCUMENTS.md](./STARTUP-DOCUMENTS.md). Service boundaries live in [SERVICES.md](./SERVICES.md). The path from plan through dev, stage, prod, and monitoring lives in [ROADMAP.md](./ROADMAP.md). This file is the product definition.
+Company, tax, and policy paperwork lives in [STARTUP-DOCUMENTS.md](./STARTUP-DOCUMENTS.md). Service boundaries live in [SERVICES.md](./SERVICES.md). Module behaviour, data, and India-specific rules live in [modules/README.md](./modules/README.md). The path from plan through dev, stage, prod, and monitoring lives in [ROADMAP.md](./ROADMAP.md). This file is the product definition.
 
 ---
 
