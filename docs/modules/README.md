@@ -14,7 +14,7 @@ This is product design informed by public rules and gateway practice. It is not 
 
 | Document | Module | Owns |
 | --- | --- | --- |
-| [01-identity](./01-identity.md) | Identity | Customer OTP, seller login, staff MFA, consent, account deletion |
+| [01-identity](./01-identity.md) | Identity | Customer OTP, seller login, staff MFA, consent, account deletion. Build spec: [identity-service.md](../services/identity-service.md) |
 | [02-catalogue](./02-catalogue.md) | Catalogue | Categories, products, variants, price, HSN, tax, origin |
 | [03-search](./03-search.md) | Search | Product index, filters, ranking disclosure |
 | [04-media](./04-media.md) | Files | Product images and private KYC objects |

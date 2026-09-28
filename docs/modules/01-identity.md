@@ -2,6 +2,7 @@
 
 **Owns:** customer phone login, seller login, staff login, sessions, roles, consent, account deletion.  
 **Service:** `identity-service`.  
+**Implementation spec:** [identity-service.md](../services/identity-service.md) (stack, APIs, Redis, and PostgreSQL schema).  
 **Does not own:** seller KYC documents (sellers module), order history (orders module).
 
 A customer, a seller, and a staff user are different accounts. A customer session cannot open Seller Centre. A seller session cannot open Admin Console.

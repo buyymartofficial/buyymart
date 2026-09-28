@@ -101,6 +101,8 @@ Production minimum is 3 replicas for `order-service` and `payment-service`. Sett
 
 ### identity-service
 
+Build spec, including the PostgreSQL schema: [services/identity-service.md](./services/identity-service.md).
+
 Customer identity is a phone number and OTP. Seller identity is email and password. Staff identity is email, password, and MFA. Sessions are opaque tokens stored hashed in Redis (`id:` prefix: OTP 5 minutes, session 30 days sliding). Consent is an append-only log. Account deletion publishes `UserDeleted` and anonymises profile fields. Orders, payments, invoices, and ledger lines stay, because tax retention requires them.
 
 Database `identity` is the only database on Aurora cluster `bm-identity`.
