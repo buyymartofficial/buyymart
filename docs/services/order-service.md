@@ -1,0 +1,675 @@
+# order-service — implementation spec
+
+**Namespace:** `commerce`  
+**Database:** Aurora PostgreSQL database `orders` on cluster `bm-commerce`. The name is `orders` because `order` is a reserved word.  
+**Cache:** ElastiCache Redis, key `idem:{key}`, TTL 24 hours. It only remembers a create that already committed. Postgres is the source. A Redis flush must not create a second order.  
+**Callers:** `customer-bff` for place, read, cancel, and return. `seller-bff` for confirm, pack, and return decisions. `admin-bff` for staff cancel and a rejection override. Browsers never call this service.  
+**Calls:** `identity-service` to introspect the session. `catalogue-service` for the live product and the current price. `inventory-service` to reserve stock. `promotion-service` when a coupon is present. `seller-service` for the seller’s state and GSTIN. `fulfilment-service` for the pin code and the delivery fee.  
+**Publishes:** `OrderPlaced`, `OrderPaid`, `OrderConfirmed`, `OrderCancelled`, `OrderDelivered`, `ReturnRequested`, `ReturnAccepted`  
+**Consumes:** `PaymentCaptured`, `PaymentFailed`, `ReservationExpired`, `ShipmentUpdated`, `RefundCompleted`  
+**Product rules:** [modules/09-orders.md](../modules/09-orders.md), [modules/08-checkout.md](../modules/08-checkout.md), [modules/12-returns.md](../modules/12-returns.md)
+
+This is the build document for the order aggregate and the only status machine. Catalogue owns the live price. Inventory owns the hold. Payments owns the gateway row. Fulfilment owns the AWB. Settlement owns the ledger. This service does not write those databases.
+
+One checkout is one order and one payment. Lines from two sellers are two groups on that order. Each group ships and settles on its own. The customer still sees one order.
+
+The browser return URL from a gateway is not a payment. Nothing in this service marks an order paid because a browser called it.
+
+---
+
+## 1. Stack
+
+| Layer | Choice | Why |
+| --- | --- | --- |
+| Language | TypeScript 5, strict | Same language as cart-service |
+| Runtime | Node.js 22 LTS | One process for the API, one for the worker |
+| HTTP | Fastify 5 | Same server as cart-service |
+| Validation | Zod | Reject a bad body before it touches Postgres |
+| SQL | `pg`, SQL migrations in `migrations/*.sql` | The schema in this file is the migration |
+| Redis | `ioredis` | The idempotency key only |
+| Ids | UUID v4 | The order id is the customer-facing order number |
+| Logs | `pino` JSON to stdout | Log the order id, customer id, and seller id. Do not log a phone, an address line, a coupon code, or a payment id |
+| Traces | OpenTelemetry SDK, W3C `traceparent` | One place-order across the BFF, catalogue, and inventory |
+| Metrics | `prom-client` on `GET /metrics` | Orders placed, stock rejections, outbox lag |
+| Image | `node:22-bookworm-slim`, non-root uid 1000 | Same image base as cart-service |
+| Container port | 8080 | Service port 80 targets 8080 |
+
+Money is an integer number of paise. A client price is ignored. The payable total the client sends must match the total this service computes.
+
+---
+
+## 2. Processes
+
+Two containers, same image.
+
+| Process | Command | Job |
+| --- | --- | --- |
+| API | `node dist/api.js` | Place, read, cancel, confirm, pack, and returns. Minimum 3 replicas in production, on the `apps` node group |
+| Worker | `node dist/worker.js` | Publishes the outbox. Applies consumed events. Sweeps prepaid orders still `payment_pending` after 15 minutes |
+
+The API does not publish to EventBridge itself. A status change and its outbox row commit in one Postgres transaction. The worker sets `published_at`. A second poll does not send the row again.
+
+`GET /health/ready` is Postgres `SELECT 1`. It does not ping Redis. Empty `REDIS_URL` skips Redis. The create route then uses the `checkout_keys` row alone. Redis down is not `503` when Postgres answers.
+
+---
+
+## 3. Modules inside the service
+
+| Module | Responsibility |
+| --- | --- |
+| `place` | Price the lines, check the pin and the coupon, insert the order, reserve stock |
+| `status` | The only writer of `orders.status` and `order_groups.status` |
+| `read` | The customer’s order, or one seller’s groups, or a staff read |
+| `cancel` | Before ship. Releases stock by publishing `order.cancelled` |
+| `returns` | Request, accept, reject. The pickup is fulfilment’s |
+| `invoice` | One invoice number per seller group, at confirm |
+| `idempotency` | `idem:{key}` and `checkout_keys` |
+| `outbox` | The events in section 10 |
+
+This service does not store a card, a CVV, a UPI PIN, a gateway secret, or an AWB.
+
+---
+
+## 4. How a request is trusted
+
+Browsers never call order-service. A BFF calls:
+
+```text
+http://order-service.commerce.svc.cluster.local
+```
+
+Every call except health and metrics carries:
+
+| Header | Rule |
+| --- | --- |
+| `Authorization` | `Bearer` service JWT. Audience `order-service`. `exp - iat` is at most 60 seconds. Algorithm HS256. Signed with `SERVICE_JWT_KEY` |
+| `X-Request-Id` | UUID. Generated by the BFF when the caller did not send one. Echoed on the response |
+| `traceparent` | W3C trace context. Forwarded to catalogue, inventory, promotion, seller, and fulfilment |
+| `X-Session-Token` | The caller’s session. This service calls identity `POST /v1/sessions/introspect`. Timeout 200 ms |
+
+A missing, expired, or wrong-audience JWT is `401 service_unauthorized`. A session identity cannot load is `503 dependency_unavailable`. An invalid session is `401 session_invalid`.
+
+| Route | Session |
+| --- | --- |
+| Place, customer read, customer cancel, return request | Family `customer`. A seller or staff token is `403 forbidden` |
+| Seller confirm, pack, return decision | Family `seller`, and `sellerId` on the session equals the group. Another seller’s group is `404 not_found` |
+| Staff read, staff cancel, staff override of a return rejection | Family `staff` |
+
+A body or query `customerId` that is not the session subject is `404 not_found`. There is no guest checkout. A request with no session is `401 session_invalid`.
+
+Consumed events are not HTTP from the public ingress. The worker takes them from the bus. In development only, `POST /internal/events` on the worker accepts one envelope. That route is absent when `NODE_ENV` is `staging` or `production`.
+
+---
+
+## 5. What is stored
+
+The order copies the catalogue numbers at place time. A later price edit does not change the row.
+
+| Order field | Meaning |
+| --- | --- |
+| `id` | The order number shown to the customer |
+| `customerId` | The session subject |
+| `status` | Derived from the groups. Section 7 |
+| `payMode` | `prepaid` or `cod` |
+| `addressSnapshot` | The checkout address. Later edits to the address book do not change it |
+| `itemsPaise`, `discountPaise`, `deliveryPaise`, `payablePaise` | Section 6 |
+| `consentAt` | When they ticked the unticked checkbox |
+| `policyVersion` | The terms version they saw |
+
+| Line field | Meaning |
+| --- | --- |
+| `sellerId`, `productId`, `variantId`, `quantity` | |
+| `title`, `hsn`, `gstRate`, `countryOfOrigin` | Snapshot |
+| `mrpPaise`, `pricePaise`, `taxablePaise`, `cgstPaise`, `sgstPaise`, `igstPaise` | Snapshot, per unit |
+| `discountPaise`, `fundedBy` | From promotions. Both zero when there is no coupon |
+| `returnWindowDays`, `returnShippingPaidBy` | Copied from the product, or from its category when the product value is null |
+| `groupStatus` | That seller’s progress |
+
+The seller who ships a group is later shown the name, phone, and address on that snapshot. This service’s seller read returns that snapshot and that seller’s lines only. It does not return the customer’s email or their other addresses.
+
+---
+
+## 6. Place an order
+
+`POST /v1/orders`. Customer session. Header `Idempotency-Key` is a UUID. A missing or non-UUID key is `400 invalid_body`.
+
+```json
+{
+  "payMode": "prepaid",
+  "couponCode": null,
+  "payablePaise": 49900,
+  "policyVersion": "2026-09-28",
+  "consent": true,
+  "address": {
+    "name": "Asha",
+    "phone": "9876543210",
+    "line1": "12 Market Road",
+    "line2": null,
+    "landmark": null,
+    "city": "Bengaluru",
+    "state": "Karnataka",
+    "pin": "560001"
+  },
+  "lines": [{ "productId": "…", "variantId": "…", "quantity": 1 }]
+}
+```
+
+`consent` must be `true`. Otherwise `400 consent_required` and nothing is written. `lines` has from 1 through 30 rows. A duplicate `variantId` is `400 invalid_body`. `quantity` is an integer from 1 through 10. A `pricePaise`, `mrpPaise`, or `sellerId` on a line is ignored and is not stored from the client.
+
+`pin` is six digits. `phone` is a 10-digit Indian mobile. The snapshot stores it as E.164. The log stores the last two digits only.
+
+### Pricing
+
+For each distinct `productId`, `GET {CATALOGUE_URL}/v1/products/{productId}` with a service JWT whose audience is `catalogue-service`. Timeout 1 second. A `404`, or a body that has no such variant, is `404 not_found`, message `This item is no longer available.` No order row. Any other failure, including a timeout, is `503 dependency_unavailable`. No order row.
+
+Copy `sellerId` from the product. Copy `title`, `hsn`, `gstRate`, `countryOfOrigin`, and the variant’s `pricePaise`, `mrpPaise`, `taxPaise`, and `taxablePaise`. Copy `returnWindowDays` from the product when it is set, otherwise from the category on that product. Copy `returnShippingPaidBy` the same way. If a required snapshot field is missing, the create is `503 dependency_unavailable`. This service does not invent a GST rate.
+
+Tax on a unit, already computed by catalogue:
+
+```text
+taxPaise = round(pricePaise * gstRate / (100 + gstRate))
+taxablePaise = pricePaise - taxPaise
+```
+
+Place of supply is the delivery address state. The seller’s state comes from `GET {SELLER_URL}/v1/sellers/{sellerId}`. Timeout 1 second.
+
+| Seller state and delivery state | Stored on the line, per unit |
+| --- | --- |
+| Same | `cgstPaise` and `sgstPaise` split `taxPaise`. `igstPaise` is 0 |
+| Different | `igstPaise` is `taxPaise`. CGST and SGST are 0 |
+
+When `taxPaise` is odd, `cgstPaise` is `round(taxPaise / 2)` and `sgstPaise` is the remainder, so the two halves sum to `taxPaise`. `round` is half away from zero.
+
+Empty `SELLER_URL` is allowed only when `NODE_ENV=development`. Every seller is then treated as the same state as the delivery address, and the invoice GSTIN is null. Stage and prod require `SELLER_URL`. A failed seller read is `503 dependency_unavailable` and no order row.
+
+### Pin and delivery fee
+
+`GET {FULFILMENT_URL}/v1/serviceability?pin=` with audience `fulfilment-service`. Timeout 1 second. The response is `{ serviceable, codServiceable, deliveryPaise }`. An unserviceable pin is `409 pin_unserviceable`, message `We don’t deliver to this pin code yet.` No order row.
+
+Empty `FULFILMENT_URL` is allowed only when `NODE_ENV=development`. The fee is then 0 and the pin is treated as serviceable, not COD-serviceable. Stage and prod require `FULFILMENT_URL`.
+
+Delivery-fee tax is 0 until finance sets `DELIVERY_TAXABLE=true`. Version 1 leaves that flag unset. The fee is stored. The invoice does not show tax on it.
+
+### Coupon
+
+A null or empty `couponCode` skips promotion-service. `discountPaise` is 0 and `fundedBy` is null.
+
+A code calls `POST {PROMOTION_URL}/v1/coupons/price` with audience `promotion-service`. Timeout 500 ms. The body is the priced lines and the code. The response is `{ discountPaise, fundedBy, lines: [{ variantId, discountPaise }] }`. The line discounts must sum to `discountPaise`. If they do not, or the call fails, the result is `409 coupon_unavailable` and no order row. This service does not place a discounted order it cannot prove.
+
+Empty `PROMOTION_URL` with a coupon code is `409 coupon_unavailable`. An order with no code still places.
+
+### Totals
+
+```text
+itemsPaise    = sum of pricePaise * quantity
+discountPaise = from promotions, or 0
+deliveryPaise = from fulfilment, or 0 in development
+payablePaise  = itemsPaise - discountPaise + deliveryPaise
+```
+
+All four are stored. If the body’s `payablePaise` is not the computed total, the response is `409 total_mismatch` and no order row.
+
+### COD
+
+`payMode` `cod` is accepted only when all of these are true: `COD_ENABLED=true`, the pin is `codServiceable`, and `payablePaise` is between `COD_MIN_PAISE` and `COD_MAX_PAISE` inclusive. Otherwise `409 cod_unavailable` and no order row. Category-level COD flags wait for catalogue to expose them. Version 1 uses the flag, the pin, and the total.
+
+### Reserve
+
+Insert the order as `created`, with one group per `sellerId` and the lines, in one transaction. Then call inventory once per group, in `sellerId` order, so two places cannot deadlock:
+
+`POST {INVENTORY_URL}/v1/reservations`
+
+```json
+{
+  "orderId": "…",
+  "sellerId": "…",
+  "paymentMethod": "prepaid",
+  "lines": [{ "variantId": "…", "quantity": 1 }]
+}
+```
+
+Audience `inventory-service`. Timeout 800 ms. `paymentMethod` is the order’s `payMode`.
+
+| Inventory result | This service |
+| --- | --- |
+| `201` or `200` for every group | Move the order to `payment_pending` (prepaid) or `cod_pending` (COD). Insert `order.placed`. Return `201` |
+| `409 stock_rejected` | Do not call the remaining groups. Insert `order.cancelled` with reason `stock_rejected` so inventory releases any hold already taken. Customer response is `409 stock_rejected` with that `variantId` and `available`. The cart is not cleared |
+| Timeout or any other status | Same cancel path. Customer response is `503 stock_unavailable` |
+
+`order.placed` is not written on the failure path. A customer read of an order that never placed is `404 not_found`.
+
+The same `Idempotency-Key` for the same customer returns the placed order with `200` and does not reserve again. The same key with a different body hash is `409 idempotency_conflict`. The key is stored in `checkout_keys` in the same transaction as the order. Redis `idem:{key}` is filled after commit. A Redis failure after commit still returns the order.
+
+`201` body:
+
+```json
+{
+  "id": "…",
+  "status": "payment_pending",
+  "payMode": "prepaid",
+  "payablePaise": 49900,
+  "groups": [
+    {
+      "sellerId": "…",
+      "status": "payment_pending",
+      "lines": [{ "variantId": "…", "productId": "…", "quantity": 1, "pricePaise": 49900 }]
+    }
+  ]
+}
+```
+
+COD returns `cod_pending` instead of `payment_pending`. There is no gateway session in this response. The BFF opens that with payment-service after `201`. The BFF then calls cart `POST /v1/cart/checkout` with this `id` and the variant ids that were placed. This service does not call cart-service.
+
+---
+
+## 7. Status
+
+```text
+created → payment_pending → paid → confirmed → packed → shipped → out_for_delivery → delivered
+                ↓                ↓         ↓        ↓        ↓
+            payment_failed    cancelled  cancelled cancelled cancelled
+delivered → return_requested → return_picked → return_accepted → refunded
+                            ↘ return_rejected
+```
+
+COD uses `cod_pending` in place of `payment_pending` until the seller confirms. A refused COD is `cancelled` with reason `cod_refused`.
+
+The order status is the least advanced group that is still open. Rank, earliest first: `payment_pending`, `cod_pending`, `paid`, `confirmed`, `packed`, `shipped`, `out_for_delivery`, `delivered`, then the return states. `cancelled`, `payment_failed`, and `return_rejected` are skipped while another group is open. When every group is terminal, the order is `cancelled` if any group is `cancelled`, otherwise `payment_failed` if any group is, otherwise the earliest return state still open.
+
+| From | To | Who |
+| --- | --- | --- |
+| `created` | `payment_pending` or `cod_pending` | This service, after every group reserved |
+| `payment_pending` | `paid` | Only `payment.captured` whose `amountPaise` equals `payablePaise` |
+| `payment_pending` | `payment_failed` | `payment.failed`, or `reservation.expired`, or the 15-minute sweep |
+| `paid` or `cod_pending` | `confirmed` | The seller for that group, or auto-confirm when `AUTO_CONFIRM=true` |
+| `confirmed` | `packed` | The seller for that group |
+| `packed` | `shipped`, then `out_for_delivery`, then `delivered` | `shipment.updated` |
+| Before `shipped` | `cancelled` | Customer, that group’s seller, or staff, with a reason |
+| `delivered` | return states | Section 9 |
+| `return_accepted` | `refunded` | `refund.completed`, or a staff COD refund reference |
+
+Version 1 does not auto-cancel when a seller misses the 24-hour confirm SLA. The group stays where it is. Staff cancel it.
+
+A capture whose `amountPaise` is not `payablePaise` does not change status. The worker logs the order id for finance and leaves the order `payment_pending`.
+
+`payment.captured` is the only way into `paid`. `POST /v1/orders/:id/paid` does not exist.
+
+Confirm inserts the invoice row for that group, then `order.confirmed` with that `sellerId`. Fulfilment books a courier on `order.confirmed`, not on `order.paid`.
+
+`AUTO_CONFIRM` defaults to false. Stage and prod leave it unset.
+
+The 15-minute sweep runs in the worker every 60 seconds. A prepaid order still `payment_pending` whose `placed_at` is older than 15 minutes becomes `payment_failed`. Inventory expires the hold on its own clock. This sweep does not call inventory and does not publish `payment.failed`.
+
+---
+
+## 8. Cancel
+
+`POST /v1/orders/:id/cancel`
+
+```json
+{ "reason": "changed_mind" }
+```
+
+`reason` is one of `changed_mind`, `seller_unavailable`, `staff`, `cod_refused`. A missing reason is `400 invalid_body`.
+
+The customer may cancel their order before any group is `shipped`. The seller may cancel only their group, and only before that group is `shipped`. Staff may cancel any group before `shipped`. A group already `shipped` is `409 already_shipped`. Cancel after ship is a return, after delivery, or a support ticket. This service does not open the ticket.
+
+One transaction sets those groups to `cancelled`, stores the reason, and inserts `order.cancelled`:
+
+```json
+{ "orderId": "…", "reason": "changed_mind", "sellerIds": ["…"] }
+```
+
+Inventory releases the hold when it consumes that event. If the order was prepaid and already `paid`, payment-service refunds from the same event. This service does not call the gateway.
+
+A second cancel of a group that is already `cancelled` is `200` and does not insert another outbox row.
+
+---
+
+## 9. Returns
+
+A return is one line inside one group. The line’s group must be `delivered`. Otherwise `409 not_delivered`. Two open returns for the same line are `409 return_open`.
+
+`POST /v1/orders/:id/returns`. Customer session.
+
+```json
+{ "variantId": "…", "quantity": 1, "reason": "damaged" }
+```
+
+`quantity` cannot exceed the line quantity. The window is `returnWindowDays` on the line, starting at the group’s `delivered_at`, through 23:59 IST on the last day. After that, `409 return_window_closed`. A line whose window is 0 is `409 not_returnable`.
+
+The line becomes `return_requested`. The event is `return.requested`:
+
+```json
+{ "orderId": "…", "sellerId": "…", "variantId": "…", "quantity": 1, "reason": "damaged" }
+```
+
+The seller, or staff, accepts or rejects within 48 hours. Silence does not auto-accept.
+
+`POST /v1/orders/:id/returns/:returnId/accept` inserts `return.accepted`:
+
+```json
+{ "orderId": "…", "sellerId": "…", "variantId": "…", "quantity": 1, "sellable": true }
+```
+
+`sellable` is true only when QC is `sellable`. `damaged` and `wrong_item` send `sellable` false. Inventory adds a unit only when `sellable` is true. This service does not change `on_hand` itself.
+
+`POST /v1/orders/:id/returns/:returnId/reject` requires `reason` from `used`, `wrong_photos`, or `not_our_item`, plus a note of at least 10 characters. The line becomes `return_rejected`. Staff may then `POST /v1/orders/:id/returns/:returnId/override` and accept it. That writes an audit row. A seller cannot override their own rejection.
+
+Fulfilment books the reverse pickup when it consumes `return.accepted`. This service stores the return AWB only when a later `shipment.updated` carries `awb` for that return. Version 1 does not book the courier.
+
+Prepaid refund amount for the line is `pricePaise * quantity` minus that line’s `discountPaise`. Delivery is not included. COD does not call the gateway. The customer sees `refunded` only after `refund.completed` or after staff `POST /v1/orders/:id/returns/:returnId/cod-refund` with a bank reference. The reference is stored. The line becomes `refunded`.
+
+---
+
+## 10. Events
+
+The envelope is `{ id, type, source, time, traceId, data }`. Wire `type` values are lowercase. `source` on publish is `order-service`.
+
+| Name | `type` | When |
+| --- | --- | --- |
+| `OrderPlaced` | `order.placed` | The order entered `payment_pending` or `cod_pending` |
+| `OrderPaid` | `order.paid` | `payment.captured` moved it to `paid` |
+| `OrderConfirmed` | `order.confirmed` | One group was confirmed. Payload includes `sellerId` |
+| `OrderCancelled` | `order.cancelled` | One or more groups were cancelled, including a stock rollback |
+| `OrderDelivered` | `order.delivered` | One group was delivered. Payload includes `sellerId` |
+| `ReturnRequested` | `return.requested` | The customer asked for a return |
+| `ReturnAccepted` | `return.accepted` | QC accepted the return |
+
+`order.placed` data:
+
+```json
+{
+  "orderId": "…",
+  "customerId": "…",
+  "payMode": "prepaid",
+  "payablePaise": 49900,
+  "lines": [{ "variantId": "…", "productId": "…", "sellerId": "…", "quantity": 1 }]
+}
+```
+
+There is no phone and no address on the event. Fulfilment reads the snapshot from this service when it books the courier.
+
+### Consumed
+
+The worker stores `processed_events.id` as the envelope `id`. A second delivery of the same id does not change status.
+
+| Event | `type` | `source` | Effect |
+| --- | --- | --- | --- |
+| `PaymentCaptured` | `payment.captured` | `payment-service` | `payment_pending` becomes `paid` when `amountPaise` equals `payablePaise` |
+| `PaymentFailed` | `payment.failed` | `payment-service` | `payment_pending` becomes `payment_failed` |
+| `ReservationExpired` | `reservation.expired` | `inventory-service` | The same, when the order is still `payment_pending` |
+| `ShipmentUpdated` | `shipment.updated` | `fulfilment-service` | Moves that seller’s group along `packed → shipped → out_for_delivery → delivered` |
+| `RefundCompleted` | `refund.completed` | `payment-service` | A `return_accepted` line becomes `refunded` |
+
+An unknown type is ignored. A payload missing `orderId` is ignored. The event id is still stored.
+
+`shipment.updated` data is `{ "orderId", "sellerId", "status" }`. `status` is `shipped`, `out_for_delivery`, or `delivered`. A skip, such as `packed` straight to `delivered`, is ignored. The group must be `packed` before `shipped`.
+
+Empty `EVENTBRIDGE_BUS_NAME` means the worker logs the envelope and does not call AWS. The development hook is the only ingest in that mode.
+
+---
+
+## 11. HTTP API
+
+Base path `/v1`. Every route except health and metrics requires the service JWT.
+
+| Method | Path | Session | Success |
+| --- | --- | --- | --- |
+| POST | `/v1/orders` | Customer | `201` placed, or `200` when the idempotency key already placed |
+| GET | `/v1/orders` | Customer | `200` that customer’s placed orders, newest first |
+| GET | `/v1/orders/:id` | Customer, seller, or staff | `200` the order. A seller sees only their lines and the ship-to snapshot |
+| POST | `/v1/orders/:id/cancel` | Customer, seller, or staff | `200` |
+| POST | `/v1/orders/:id/groups/:sellerId/confirm` | That seller, or staff | `200` `confirmed`, with an invoice number |
+| POST | `/v1/orders/:id/groups/:sellerId/pack` | That seller, or staff | `200` `packed` |
+| POST | `/v1/orders/:id/returns` | Customer | `201` |
+| POST | `/v1/orders/:id/returns/:returnId/accept` | That seller, or staff | `200` |
+| POST | `/v1/orders/:id/returns/:returnId/reject` | That seller, or staff | `200` |
+| POST | `/v1/orders/:id/returns/:returnId/override` | Staff | `200` accepted |
+| POST | `/v1/orders/:id/returns/:returnId/cod-refund` | Staff | `200` `refunded` |
+| GET | `/health/live` | None. No JWT | `200` if the process is up |
+| GET | `/health/ready` | None. No JWT | `200` only after Postgres `SELECT 1` |
+| GET | `/metrics` | None. No JWT | Prometheus text |
+
+JSON errors use `{ "code", "message", "requestId" }`. `message` is safe to show.
+
+| Code | HTTP | When |
+| --- | --- | --- |
+| `invalid_body` | 400 | Bad JSON, a bad pin, a bad phone, a duplicate variant |
+| `consent_required` | 400 | `consent` is not `true` |
+| `session_invalid` | 401 | No session, or identity rejected it |
+| `service_unauthorized` | 401 | Bad service JWT |
+| `forbidden` | 403 | Seller or staff on a customer route, or a customer on a seller route |
+| `not_found` | 404 | Another customer’s order, an order that never placed, another seller’s group |
+| `pin_unserviceable` | 409 | Fulfilment said the pin is not served |
+| `coupon_unavailable` | 409 | The coupon could not be priced |
+| `total_mismatch` | 409 | `payablePaise` is not the computed total |
+| `cod_unavailable` | 409 | COD is off, the pin is not COD, or the total is outside the range |
+| `stock_rejected` | 409 | Inventory could not hold a line. Body includes `variantId` and `available` |
+| `idempotency_conflict` | 409 | The same key was reused with a different body |
+| `already_shipped` | 409 | Cancel after `shipped` |
+| `not_delivered` | 409 | Return before delivery |
+| `return_open` | 409 | That line already has an open return |
+| `return_window_closed` | 409 | The copied window has ended |
+| `not_returnable` | 409 | `returnWindowDays` is 0 |
+| `dependency_unavailable` | 503 | Identity, catalogue, seller, or fulfilment failed |
+| `stock_unavailable` | 503 | Inventory timed out or returned another error |
+| `orders_unavailable` | 503 | Postgres is down |
+
+`orders_placed_total` counts `201` responses. `orders_stock_rejected_total` counts `409 stock_rejected`. `orders_outbox_unpublished` is the gauge of rows with `published_at` null. Set the gauge on `GET /metrics`.
+
+---
+
+## 12. PostgreSQL schema
+
+Database `orders`. The application role `orders_app` can `SELECT`, `INSERT`, and `UPDATE` these tables. It cannot `DELETE`, `DROP`, `TRUNCATE`, or alter schema. A cancel is a status change, not a delete. The migration role `orders_migrator` runs `migrations/` and is not the runtime role. The API refuses to start if `DATABASE_MIGRATOR_URL` is set or if `DATABASE_URL` uses `orders_migrator`.
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+CREATE TYPE order_pay_mode AS ENUM ('prepaid', 'cod');
+
+CREATE TYPE order_status AS ENUM (
+  'created', 'payment_pending', 'cod_pending', 'paid', 'confirmed', 'packed',
+  'shipped', 'out_for_delivery', 'delivered', 'payment_failed', 'cancelled',
+  'return_requested', 'return_picked', 'return_accepted', 'return_rejected', 'refunded'
+);
+
+CREATE TABLE orders (
+  id             uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  customer_id    uuid NOT NULL,
+  status         order_status NOT NULL,
+  pay_mode       order_pay_mode NOT NULL,
+  address        jsonb NOT NULL,
+  items_paise    integer NOT NULL CHECK (items_paise >= 0),
+  discount_paise integer NOT NULL CHECK (discount_paise >= 0),
+  delivery_paise integer NOT NULL CHECK (delivery_paise >= 0),
+  payable_paise  integer NOT NULL CHECK (payable_paise >= 0),
+  consent_at     timestamptz NOT NULL,
+  policy_version text NOT NULL,
+  placed_at      timestamptz,
+  created_at     timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE order_groups (
+  order_id    uuid NOT NULL REFERENCES orders (id),
+  seller_id   uuid NOT NULL,
+  status      order_status NOT NULL,
+  delivered_at timestamptz,
+  PRIMARY KEY (order_id, seller_id)
+);
+
+CREATE TABLE order_lines (
+  order_id                 uuid NOT NULL,
+  variant_id               uuid NOT NULL,
+  product_id               uuid NOT NULL,
+  seller_id                uuid NOT NULL,
+  quantity                 integer NOT NULL CHECK (quantity BETWEEN 1 AND 10),
+  title                    text NOT NULL,
+  hsn                      text NOT NULL,
+  gst_rate                 integer NOT NULL,
+  country_of_origin        text NOT NULL,
+  mrp_paise                integer NOT NULL,
+  price_paise              integer NOT NULL,
+  taxable_paise            integer NOT NULL,
+  cgst_paise               integer NOT NULL,
+  sgst_paise               integer NOT NULL,
+  igst_paise               integer NOT NULL,
+  discount_paise           integer NOT NULL DEFAULT 0,
+  funded_by                text,
+  return_window_days       smallint NOT NULL,
+  return_shipping_paid_by  text NOT NULL,
+  line_status              order_status NOT NULL,
+  PRIMARY KEY (order_id, variant_id),
+  FOREIGN KEY (order_id, seller_id) REFERENCES order_groups (order_id, seller_id)
+);
+
+CREATE TABLE checkout_keys (
+  idempotency_key uuid PRIMARY KEY,
+  customer_id     uuid NOT NULL,
+  order_id        uuid NOT NULL REFERENCES orders (id),
+  body_hash       text NOT NULL,
+  created_at      timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE invoices (
+  id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  order_id      uuid NOT NULL,
+  seller_id     uuid NOT NULL,
+  invoice_number text NOT NULL UNIQUE,
+  gstin         text,
+  pdf_key       text,
+  created_at    timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (order_id, seller_id)
+);
+
+CREATE TABLE invoice_sequences (
+  seller_id uuid NOT NULL,
+  year      integer NOT NULL,
+  last_n    integer NOT NULL,
+  PRIMARY KEY (seller_id, year)
+);
+
+CREATE TABLE returns (
+  id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  order_id    uuid NOT NULL,
+  variant_id  uuid NOT NULL,
+  quantity    integer NOT NULL,
+  reason      text NOT NULL,
+  status      order_status NOT NULL,
+  sellable    boolean,
+  note        text,
+  cod_reference text,
+  created_at  timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (order_id, variant_id, status)
+);
+
+CREATE TABLE audit (
+  id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  order_id   uuid NOT NULL,
+  actor_id   uuid NOT NULL,
+  action     text NOT NULL,
+  at         timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE outbox (
+  id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  type         text NOT NULL,
+  payload      jsonb NOT NULL,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  published_at timestamptz
+);
+
+CREATE INDEX outbox_unpublished_idx ON outbox (created_at) WHERE published_at IS NULL;
+
+CREATE TABLE processed_events (
+  id          uuid PRIMARY KEY,
+  type        text NOT NULL,
+  processed_at timestamptz NOT NULL DEFAULT now()
+);
+```
+
+Invoice numbers are `{year}-{n}` per seller, from `invoice_sequences`, and are never reused. `n` increases by one inside the confirm transaction.
+
+The advisory lock for migrations is `2147483006`.
+
+---
+
+## 13. Config and secrets
+
+| Kind | Name | Example |
+| --- | --- | --- |
+| Secret | `DATABASE_URL` | `orders_app` connection string |
+| Secret | `DATABASE_MIGRATOR_URL` | Migration job only. The API refuses to start if this is set |
+| Secret | `SERVICE_JWT_KEY` | HMAC key. Audience `order-service` |
+| Config | `REDIS_URL` | ElastiCache in stage and prod. Empty skips the idempotency cache |
+| Config | `IDENTITY_URL` | Introspect sessions |
+| Config | `CATALOGUE_URL` | Live product. Required in stage and prod |
+| Config | `INVENTORY_URL` | Reserve. Required in stage and prod |
+| Config | `PROMOTION_URL` | Empty until promotion-service is deployed |
+| Config | `SELLER_URL` | Empty in development only |
+| Config | `FULFILMENT_URL` | Empty in development only |
+| Config | `COD_ENABLED` | `false` until finance turns COD on |
+| Config | `COD_MIN_PAISE`, `COD_MAX_PAISE` | Used only when COD is on |
+| Config | `AUTO_CONFIRM` | Default false |
+| Config | `INVOICE_BUCKET` | Empty skips the PDF object and still stores the invoice row |
+| Config | `EVENTBRIDGE_BUS_NAME` | Empty means the worker logs the envelope and does not call AWS |
+
+Secrets live in Secrets Manager at `buyymart/{env}/order-service`. They are not in the image and not in git. Stage and prod set `CATALOGUE_URL`, `INVENTORY_URL`, `SELLER_URL`, and `FULFILMENT_URL`. They do not contain a database password.
+
+---
+
+## 14. Local run
+
+Docker Compose for this service is Postgres 16, Redis, the API, and the worker. Identity, catalogue, and inventory must already be running. Tests inject those clients and do not start Compose.
+
+Migrations run before the API starts. Host ports are 8093 for the API, 8094 for the worker, and 6382 for Redis, so this stack can run beside cart on 8091 and inventory on 8089. The Redis key is still `idem:{key}`.
+
+`POST /internal/events` on the worker accepts one envelope from section 10 only when `NODE_ENV=development`. It requires the service JWT and is not registered in staging or production.
+
+---
+
+## 15. What has to be tested before the first deploy
+
+| Test | Expected |
+| --- | --- |
+| Place one live line, `consent: true`, matching `payablePaise` | `201` `payment_pending`. Snapshot price is the catalogue price. A client `pricePaise` is not what was stored |
+| `consent` false | `400 consent_required`. No order row |
+| Catalogue `404` | `404 not_found`. No order row |
+| `payablePaise` off by one | `409 total_mismatch`. No order row |
+| Inventory `409` with `available` 1 | `409 stock_rejected`. No `order.placed`. An `order.cancelled` exists so the hold can release |
+| Inventory timeout | `503 stock_unavailable`. No `order.placed` |
+| Same `Idempotency-Key` and same body | `200` and the same order id. `reserved` is not incremented again |
+| Same key, different body | `409 idempotency_conflict` |
+| Guest, or a seller session, on `POST /v1/orders` | `403 forbidden` |
+| `payment.captured` with the right `amountPaise` | Status `paid`. One `order.paid`. A second delivery does not write another row |
+| `payment.captured` with a different amount | Stays `payment_pending` |
+| `reservation.expired` while `payment_pending` | `payment_failed` |
+| Seller confirms their group | `confirmed`, one invoice number, one `order.confirmed` |
+| Another seller confirms that group | `404 not_found` |
+| Customer cancel before ship | `cancelled`, one `order.cancelled` |
+| Cancel after `shipped` | `409 already_shipped` |
+| Return before delivery | `409 not_delivered` |
+| Return inside the copied window | `201`, one `return.requested` |
+| Accept with `sellable: true` | `return.accepted` payload includes `sellable: true` |
+| Redis down, Postgres up | A repeat key still returns the first order. Ready stays `200` |
+| Postgres down | Place is `503 orders_unavailable`. Ready `503`. Live stays `200` |
+| Worker publish | `published_at` is set. A second poll does not send it |
+| `NODE_ENV=production` | `POST /internal/events` is not registered |
+
+---
+
+## 16. Outside this service
+
+| Concern | Owner |
+| --- | --- |
+| Live price, HSN, GST, return window | `catalogue-service`. This service copies them |
+| The hold, the 15-minute expiry, and putting a sellable return back on hand | `inventory-service` |
+| Clearing the cart lines that were placed | `customer-bff`, calling `cart-service` after `201` |
+| The gateway session, the webhook, and the refund call | `payment-service` |
+| Pin code, delivery fee, labels, and the return pickup | `fulfilment-service` |
+| Coupon proof | `promotion-service` |
+| Seller legal name, GSTIN, and state | `seller-service` |
+| Ledger, TCS, commission | `settlement-service` |
+| SMS | `notification-service`, from these events |
+| A ticket that is not a return | `support-service` |
